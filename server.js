@@ -57,6 +57,20 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Debug endpoint to check environment variables
+app.get('/debug-env', (req, res) => {
+  res.status(200).json({
+    NODE_ENV: process.env.NODE_ENV,
+    PORT: process.env.PORT,
+    R2_ACCESS_KEY: !!process.env.R2_ACCESS_KEY,
+    R2_SECRET_KEY: !!process.env.R2_SECRET_KEY,
+    R2_ACCOUNT_ID: !!process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: !!process.env.R2_BUCKET,
+    R2_BUCKET_VALUE: process.env.R2_BUCKET,
+    allR2Vars: Object.keys(process.env).filter(key => key.startsWith('R2_'))
+  });
+});
+
 // Get signed download URL
 app.get('/getSignedUrl', async (req, res) => {
   try {
@@ -84,8 +98,11 @@ app.get('/getSignedUrl', async (req, res) => {
       Key: sanitizedFile,
     });
 
+    // Generate iOS-compatible signed URL
     const signedUrl = await getSignedUrl(s3Client, command, {
       expiresIn: 3600, // 1 hour
+      // iOS-compatible options - avoid problematic query parameters
+      signableHeaders: new Set(['host']), // Only sign host header
     });
 
     res.json({
@@ -108,6 +125,82 @@ app.get('/getSignedUrl', async (req, res) => {
     
     res.status(500).json({
       error: 'Failed to generate signed URL',
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Get iOS-compatible signed download URL for audio files
+app.get('/getIOSAudioUrl', async (req, res) => {
+  try {
+    const { file } = req.query;
+    
+    if (!file) {
+      return res.status(400).json({
+        error: 'File parameter is required',
+        example: '/getIOSAudioUrl?file=books/audio.mp3'
+      });
+    }
+
+    // Validate file parameter
+    if (typeof file !== 'string' || file.trim() === '') {
+      return res.status(400).json({
+        error: 'Invalid file parameter'
+      });
+    }
+
+    // Sanitize file path (basic security)
+    const sanitizedFile = file.replace(/\.\./g, '').trim();
+    
+    // Check if it's an audio file
+    const audioExtensions = ['.mp3', '.m4a', '.aac', '.wav'];
+    const isAudioFile = audioExtensions.some(ext => sanitizedFile.toLowerCase().endsWith(ext));
+    
+    if (!isAudioFile) {
+      return res.status(400).json({
+        error: 'File must be an audio file (.mp3, .m4a, .aac, .wav)'
+      });
+    }
+    
+    const command = new GetObjectCommand({
+      Bucket: process.env.R2_BUCKET,
+      Key: sanitizedFile,
+      // Ensure proper content type for audio files
+      ResponseContentType: sanitizedFile.toLowerCase().endsWith('.mp3') ? 'audio/mpeg' : 
+                          sanitizedFile.toLowerCase().endsWith('.m4a') ? 'audio/mp4' :
+                          sanitizedFile.toLowerCase().endsWith('.aac') ? 'audio/aac' :
+                          'audio/wav',
+    });
+
+    // Generate iOS-compatible signed URL with minimal parameters
+    const signedUrl = await getSignedUrl(s3Client, command, {
+      expiresIn: 3600, // 1 hour
+      // iOS-compatible options - minimal query parameters
+      signableHeaders: new Set(['host']), // Only sign host header
+    });
+
+    res.json({
+      success: true,
+      signedUrl,
+      file: sanitizedFile,
+      contentType: command.input.ResponseContentType,
+      expiresIn: 3600,
+      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+      platform: 'ios-optimized'
+    });
+
+  } catch (error) {
+    console.error('Error generating iOS audio signed URL:', error);
+    
+    if (error.name === 'NoSuchKey') {
+      return res.status(404).json({
+        error: 'Audio file not found',
+        file: req.query.file
+      });
+    }
+    
+    res.status(500).json({
+      error: 'Failed to generate iOS audio signed URL',
       message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
   }
@@ -141,8 +234,11 @@ app.post('/getUploadUrl', async (req, res) => {
       ContentType: contentType,
     });
 
+    // Generate iOS-compatible signed URL
     const signedUrl = await getSignedUrl(s3Client, command, {
       expiresIn: 3600, // 1 hour
+      // iOS-compatible options - avoid problematic query parameters
+      signableHeaders: new Set(['host']), // Only sign host header
     });
 
     res.json({
