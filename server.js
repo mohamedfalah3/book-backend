@@ -159,7 +159,13 @@ app.post('/getUploadUrl', async (req, res) => {
     
     res.status(500).json({
       error: 'Failed to generate signed URL',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+      message: error.message || 'Internal server error',
+      details: {
+        bucket: process.env.R2_BUCKET,
+        accountId: process.env.R2_ACCOUNT_ID,
+        hasAccessKey: !!process.env.R2_ACCESS_KEY,
+        hasSecretKey: !!process.env.R2_SECRET_KEY
+      }
     });
   }
 });
