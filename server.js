@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 require('dotenv').config();
 
@@ -25,7 +25,7 @@ app.use(helmet());
 // CORS configuration for React Native
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
@@ -266,6 +266,71 @@ app.post('/getUploadUrl', async (req, res) => {
   }
 });
 
+// Delete file from R2
+app.delete('/deleteFile', async (req, res) => {
+  try {
+    const { file } = req.body;
+    
+    if (!file) {
+      return res.status(400).json({
+        error: 'File parameter is required in request body',
+        example: { file: 'books/cover.jpg' }
+      });
+    }
+
+    // Validate file parameter
+    if (typeof file !== 'string' || file.trim() === '') {
+      return res.status(400).json({
+        error: 'Invalid file parameter'
+      });
+    }
+
+    // Sanitize file path (basic security)
+    const sanitizedFile = file.replace(/\.\./g, '').trim();
+    
+    console.log(`Attempting to delete file: ${sanitizedFile} from bucket: ${process.env.R2_BUCKET}`);
+    
+    const command = new DeleteObjectCommand({
+      Bucket: process.env.R2_BUCKET,
+      Key: sanitizedFile,
+    });
+
+    await s3Client.send(command);
+
+    console.log(`Successfully deleted file: ${sanitizedFile}`);
+
+    res.json({
+      success: true,
+      message: 'File deleted successfully',
+      file: sanitizedFile,
+      deletedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error deleting file from R2:', error);
+    
+    // Check if it's a "NoSuchKey" error (file doesn't exist)
+    if (error.name === 'NoSuchKey') {
+      return res.status(404).json({
+        error: 'File not found',
+        message: 'The specified file does not exist in the bucket',
+        file: req.body.file
+      });
+    }
+    
+    res.status(500).json({
+      error: 'Failed to delete file',
+      message: error.message || 'Internal server error',
+      details: {
+        bucket: process.env.R2_BUCKET,
+        accountId: process.env.R2_ACCOUNT_ID,
+        hasAccessKey: !!process.env.R2_ACCESS_KEY,
+        hasSecretKey: !!process.env.R2_SECRET_KEY
+      }
+    });
+  }
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
@@ -282,7 +347,8 @@ app.use('*', (req, res) => {
     availableEndpoints: [
       'GET /health',
       'GET /getSignedUrl?file=FILENAME',
-      'POST /getUploadUrl'
+      'POST /getUploadUrl',
+      'DELETE /deleteFile'
     ]
   });
 });
