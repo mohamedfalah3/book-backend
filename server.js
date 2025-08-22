@@ -93,9 +93,33 @@ app.get('/getSignedUrl', async (req, res) => {
     // Sanitize file path (basic security)
     const sanitizedFile = file.replace(/\.\./g, '').trim();
     
+    // Determine content type and headers based on file extension
+    const fileExtension = sanitizedFile.split('.').pop()?.toLowerCase();
+    let responseContentType = 'application/octet-stream';
+    let responseContentDisposition = 'inline';
+    
+    if (fileExtension) {
+      if (['mp3'].includes(fileExtension)) {
+        responseContentType = 'audio/mpeg';
+      } else if (['m4a'].includes(fileExtension)) {
+        responseContentType = 'audio/mp4';
+      } else if (['aac'].includes(fileExtension)) {
+        responseContentType = 'audio/aac';
+      } else if (['wav'].includes(fileExtension)) {
+        responseContentType = 'audio/wav';
+      } else if (['jpg', 'jpeg'].includes(fileExtension)) {
+        responseContentType = 'image/jpeg';
+      } else if (['png'].includes(fileExtension)) {
+        responseContentType = 'image/png';
+      }
+    }
+    
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET,
       Key: sanitizedFile,
+      ResponseContentType: responseContentType,
+      ResponseContentDisposition: responseContentDisposition,
+      ResponseCacheControl: responseContentType.startsWith('audio/') ? 'public, max-age=31536000' : undefined,
     });
 
     // Generate iOS-compatible signed URL
@@ -109,6 +133,7 @@ app.get('/getSignedUrl', async (req, res) => {
       success: true,
       signedUrl,
       file: sanitizedFile,
+      contentType: responseContentType,
       expiresIn: 3600,
       expiresAt: new Date(Date.now() + 3600 * 1000).toISOString()
     });
@@ -162,14 +187,29 @@ app.get('/getIOSAudioUrl', async (req, res) => {
       });
     }
     
+    // Determine optimal content type for iOS
+    const fileExtension = sanitizedFile.split('.').pop()?.toLowerCase();
+    let responseContentType = 'audio/mpeg';
+    
+    if (fileExtension === 'm4a') {
+      responseContentType = 'audio/mp4';
+    } else if (fileExtension === 'aac') {
+      responseContentType = 'audio/aac';
+    } else if (fileExtension === 'wav') {
+      responseContentType = 'audio/wav';
+    } else if (fileExtension === 'mp3') {
+      responseContentType = 'audio/mpeg';
+    }
+    
     const command = new GetObjectCommand({
       Bucket: process.env.R2_BUCKET,
       Key: sanitizedFile,
-      // Ensure proper content type for audio files
-      ResponseContentType: sanitizedFile.toLowerCase().endsWith('.mp3') ? 'audio/mpeg' : 
-                          sanitizedFile.toLowerCase().endsWith('.m4a') ? 'audio/mp4' :
-                          sanitizedFile.toLowerCase().endsWith('.aac') ? 'audio/aac' :
-                          'audio/wav',
+      // iOS-optimized response headers
+      ResponseContentType: responseContentType,
+      ResponseContentDisposition: 'inline',
+      ResponseCacheControl: 'public, max-age=31536000',
+      // Ensure range requests work for iOS AVPlayer
+      ResponseAcceptRanges: 'bytes',
     });
 
     // Generate iOS-compatible signed URL with minimal parameters
@@ -183,10 +223,16 @@ app.get('/getIOSAudioUrl', async (req, res) => {
       success: true,
       signedUrl,
       file: sanitizedFile,
-      contentType: command.input.ResponseContentType,
+      contentType: responseContentType,
       expiresIn: 3600,
       expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
-      platform: 'ios-optimized'
+      platform: 'ios-optimized',
+      headers: {
+        'Content-Type': responseContentType,
+        'Content-Disposition': 'inline',
+        'Cache-Control': 'public, max-age=31536000',
+        'Accept-Ranges': 'bytes'
+      }
     });
 
   } catch (error) {
@@ -228,10 +274,27 @@ app.post('/getUploadUrl', async (req, res) => {
     // Sanitize file path (basic security)
     const sanitizedFile = file.replace(/\.\./g, '').trim();
     
+    // Prepare metadata for audio files
+    const metadata = {};
+    if (contentType.startsWith('audio/')) {
+      metadata['Content-Disposition'] = 'inline';
+      metadata['Cache-Control'] = 'public, max-age=31536000';
+      
+      // Ensure proper content type for iOS compatibility
+      if (contentType === 'audio/mpeg') {
+        metadata['Content-Type'] = 'audio/mpeg';
+      } else if (contentType === 'audio/mp4') {
+        metadata['Content-Type'] = 'audio/mp4';
+      } else if (contentType === 'audio/aac') {
+        metadata['Content-Type'] = 'audio/aac';
+      }
+    }
+    
     const command = new PutObjectCommand({
       Bucket: process.env.R2_BUCKET,
       Key: sanitizedFile,
       ContentType: contentType,
+      Metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
     });
 
     // Generate iOS-compatible signed URL
@@ -246,6 +309,7 @@ app.post('/getUploadUrl', async (req, res) => {
       signedUrl,
       file: sanitizedFile,
       contentType,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       expiresIn: 3600,
       expiresAt: new Date(Date.now() + 3600 * 1000).toISOString()
     });
