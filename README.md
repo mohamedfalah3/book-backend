@@ -6,6 +6,7 @@ A Node.js Express server that provides signed URLs for Cloudflare R2 storage, en
 
 - **Signed Download URLs**: Generate secure URLs for downloading files from R2
 - **Signed Upload URLs**: Generate secure URLs for uploading files directly to R2
+- **iOS Audio Optimization**: Special endpoints with proper headers for iOS AVPlayer compatibility
 - **CORS Support**: Configured for React Native apps
 - **Rate Limiting**: Built-in protection against abuse
 - **Security**: Helmet.js for security headers
@@ -100,8 +101,40 @@ curl "http://localhost:3000/getSignedUrl?file=books/cover.jpg"
   "success": true,
   "signedUrl": "https://...",
   "file": "books/cover.jpg",
+  "contentType": "image/jpeg",
   "expiresIn": 3600,
   "expiresAt": "2024-01-15T10:30:00.000Z"
+}
+```
+
+### Get iOS-Optimized Audio URL
+```
+GET /getIOSAudioUrl?file=FILENAME
+```
+
+**Description:** Special endpoint for audio files with iOS-optimized headers including `Accept-Ranges: bytes` for streaming support.
+
+**Example:**
+```bash
+curl "http://localhost:3000/getIOSAudioUrl?file=books/audio.mp3"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "signedUrl": "https://...",
+  "file": "books/audio.mp3",
+  "contentType": "audio/mpeg",
+  "expiresIn": 3600,
+  "expiresAt": "2024-01-15T10:30:00.000Z",
+  "platform": "ios-optimized",
+  "headers": {
+    "Content-Type": "audio/mpeg",
+    "Content-Disposition": "inline",
+    "Cache-Control": "public, max-age=31536000",
+    "Accept-Ranges": "bytes"
+  }
 }
 ```
 
@@ -223,6 +256,42 @@ if (fileUrl) {
   console.log('File downloaded:', fileUrl);
 }
 ```
+
+## 🎵 Audio Upload Improvements
+
+### iOS Compatibility
+
+This backend includes special optimizations for audio files to ensure compatibility with iOS AVPlayer:
+
+#### Key Features:
+- **Proper Headers**: Sets correct `Content-Type`, `Content-Disposition`, and `Cache-Control` headers
+- **Range Requests**: Includes `Accept-Ranges: bytes` for streaming support
+- **iOS-Optimized Endpoint**: `/getIOSAudioUrl` for audio files with enhanced headers
+- **Format Support**: Optimized for MP3, M4A, AAC, and WAV formats
+
+#### Supported Audio Headers:
+```json
+{
+  "Content-Type": "audio/mpeg|audio/mp4|audio/aac|audio/wav",
+  "Content-Disposition": "inline",
+  "Cache-Control": "public, max-age=31536000",
+  "Accept-Ranges": "bytes"
+}
+```
+
+#### Usage for Audio Files:
+```typescript
+// For iOS-optimized audio downloads
+const audioUrl = await fetch(`https://your-backend.com/getIOSAudioUrl?file=books/audio.mp3`);
+const { signedUrl } = await audioUrl.json();
+
+// Use signedUrl with AVPlayer or other audio players
+```
+
+### Audio Format Recommendations:
+- **iOS**: M4A (AAC) - Most reliable
+- **Android**: MP3 or M4A - Both work well
+- **Cross-platform**: M4A - Safest choice
 
 ## 🚀 Deployment
 
