@@ -2,12 +2,63 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const NodeCache = require('node-cache');
 const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Cache configuration
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS) || 600; // 10 minutes default
+const CACHE_CHECK_PERIOD = 60; // Check for expired keys every 60 seconds
+const MAX_CACHE_KEYS = parseInt(process.env.MAX_CACHE_KEYS) || 1000; // Maximum cached URLs
+
+// Initialize in-memory cache
+const signedUrlCache = new NodeCache({
+  stdTTL: CACHE_TTL,
+  checkperiod: CACHE_CHECK_PERIOD,
+  maxKeys: MAX_CACHE_KEYS,
+  useClones: false // Better performance, we don't modify cached objects
+});
+
+// Optional Redis cache (if Redis URL is provided)
+let redisClient = null;
+if (process.env.REDIS_URL) {
+  const redis = require('redis');
+  redisClient = redis.createClient({
+    url: process.env.REDIS_URL,
+    retry_strategy: (options) => {
+      if (options.error && options.error.code === 'ECONNREFUSED') {
+        console.log('Redis connection refused, falling back to in-memory cache');
+        return undefined; // Stop retrying
+      }
+      if (options.total_retry_time > 1000 * 60 * 60) {
+        return new Error('Redis retry time exhausted');
+      }
+      return Math.min(options.attempt * 100, 3000);
+    }
+  });
+
+  redisClient.on('error', (err) => {
+    console.log('Redis Client Error:', err);
+    console.log('Falling back to in-memory cache');
+    redisClient = null;
+  });
+
+  redisClient.on('connect', () => {
+    console.log('✅ Redis connected successfully');
+  });
+
+  // Connect to Redis
+  if (redisClient) {
+    redisClient.connect().catch((err) => {
+      console.log('Failed to connect to Redis:', err);
+      redisClient = null;
+    });
+  }
+}
 
 // Initialize S3 client for R2
 const s3Client = new S3Client({
@@ -18,28 +69,6 @@ const s3Client = new S3Client({
     secretAccessKey: process.env.R2_SECRET_KEY,
   },
 });
-
-// R2 Domain Configuration
-const R2_CONFIG = {
-  useCustomDomain: process.env.R2_USE_CUSTOM_DOMAIN === 'true',
-  customDomain: process.env.R2_CUSTOM_DOMAIN || null,
-  directEndpoint: `${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  bucketName: process.env.R2_BUCKET
-};
-
-/**
- * Get the appropriate URL for R2 files
- */
-function getR2FileUrl(filePath) {
-  // Remove r2:// prefix if present
-  const cleanPath = filePath.startsWith('r2://') ? filePath.replace('r2://', '') : filePath;
-  
-  if (R2_CONFIG.useCustomDomain && R2_CONFIG.customDomain) {
-    return `https://${R2_CONFIG.customDomain}/${cleanPath}`;
-  }
-  
-  return `https://${R2_CONFIG.directEndpoint}/${cleanPath}`;
-}
 
 // Security middleware
 app.use(helmet());
@@ -65,6 +94,81 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+// Cache utility functions
+class CacheService {
+  static generateCacheKey(bucket, key, operation = 'get') {
+    return `r2:${operation}:${bucket}:${key}`;
+  }
+
+  static async get(cacheKey) {
+    try {
+      // Try Redis first if available
+      if (redisClient && redisClient.isReady) {
+        const cached = await redisClient.get(cacheKey);
+        if (cached) {
+          console.log(`✅ Cache HIT (Redis): ${cacheKey}`);
+          return cached;
+        }
+      }
+
+      // Fall back to in-memory cache
+      const cached = signedUrlCache.get(cacheKey);
+      if (cached) {
+        console.log(`✅ Cache HIT (Memory): ${cacheKey}`);
+        return cached;
+      }
+
+      console.log(`❌ Cache MISS: ${cacheKey}`);
+      return null;
+    } catch (error) {
+      console.error('Cache get error:', error);
+      return null;
+    }
+  }
+
+  static async set(cacheKey, value, ttl = CACHE_TTL) {
+    try {
+      // Store in Redis if available
+      if (redisClient && redisClient.isReady) {
+        await redisClient.setEx(cacheKey, ttl, value);
+        console.log(`💾 Cached to Redis: ${cacheKey} (TTL: ${ttl}s)`);
+      }
+
+      // Always store in memory cache as backup
+      signedUrlCache.set(cacheKey, value, ttl);
+      console.log(`💾 Cached to Memory: ${cacheKey} (TTL: ${ttl}s)`);
+    } catch (error) {
+      console.error('Cache set error:', error);
+      // Continue execution even if caching fails
+    }
+  }
+
+  static async del(cacheKey) {
+    try {
+      if (redisClient && redisClient.isReady) {
+        await redisClient.del(cacheKey);
+      }
+      signedUrlCache.del(cacheKey);
+      console.log(`🗑️ Cache DELETED: ${cacheKey}`);
+    } catch (error) {
+      console.error('Cache delete error:', error);
+    }
+  }
+
+  static getStats() {
+    const memoryStats = signedUrlCache.getStats();
+    return {
+      memory: {
+        keys: memoryStats.keys,
+        hits: memoryStats.hits,
+        misses: memoryStats.misses,
+        hitRate: memoryStats.hits / (memoryStats.hits + memoryStats.misses) || 0
+      },
+      redis: redisClient && redisClient.isReady ? 'connected' : 'disconnected'
+    };
+  }
+}
+
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -75,124 +179,8 @@ app.get('/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     service: 'R2 Signed URL Service',
-    version: '1.0.0',
-    r2Config: {
-      useCustomDomain: R2_CONFIG.useCustomDomain,
-      customDomain: R2_CONFIG.customDomain || 'not configured',
-      bucketName: R2_CONFIG.bucketName
-    }
+    version: '1.0.0'
   });
-});
-
-// Get CDN URL (direct access via custom domain)
-app.get('/getCDNUrl', async (req, res) => {
-  try {
-    const { file } = req.query;
-    
-    if (!file) {
-      return res.status(400).json({
-        error: 'File parameter is required',
-        example: '/getCDNUrl?file=books/cover.jpg'
-      });
-    }
-
-    // Validate file parameter
-    if (typeof file !== 'string' || file.trim() === '') {
-      return res.status(400).json({
-        error: 'Invalid file parameter'
-      });
-    }
-
-    // Sanitize file path
-    const sanitizedFile = file.replace(/\.\./g, '').trim();
-    
-    // Check if custom domain is configured
-    if (!R2_CONFIG.useCustomDomain || !R2_CONFIG.customDomain) {
-      return res.status(503).json({
-        error: 'CDN not configured',
-        message: 'Custom domain is not set up for this R2 bucket',
-        fallback: 'Use /getSignedUrl instead'
-      });
-    }
-    
-    // Generate CDN URL
-    const cdnUrl = getR2FileUrl(sanitizedFile);
-    
-    res.json({
-      success: true,
-      cdnUrl,
-      file: sanitizedFile,
-      domain: R2_CONFIG.customDomain,
-      cached: true,
-      expiresIn: 86400, // CDN cache duration
-      expiresAt: new Date(Date.now() + 86400 * 1000).toISOString(),
-      source: 'cdn'
-    });
-
-  } catch (error) {
-    console.error('Error generating CDN URL:', error);
-    
-    res.status(500).json({
-      error: 'Failed to generate CDN URL',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
-  }
-});
-
-// Batch CDN URLs endpoint
-app.post('/getBatchCDNUrls', async (req, res) => {
-  try {
-    const { files } = req.body;
-    
-    if (!files || !Array.isArray(files)) {
-      return res.status(400).json({
-        error: 'Files array is required',
-        example: { files: ['books/cover1.jpg', 'books/cover2.jpg'] }
-      });
-    }
-
-    if (files.length > 100) {
-      return res.status(400).json({
-        error: 'Too many files requested',
-        message: 'Maximum 100 files per batch request'
-      });
-    }
-    
-    // Check if custom domain is configured
-    if (!R2_CONFIG.useCustomDomain || !R2_CONFIG.customDomain) {
-      return res.status(503).json({
-        error: 'CDN not configured',
-        message: 'Custom domain is not set up for this R2 bucket'
-      });
-    }
-    
-    // Generate CDN URLs for all files
-    const results = files.map(file => {
-      const sanitizedFile = file.replace(/\.\./g, '').trim();
-      return {
-        originalFile: file,
-        file: sanitizedFile,
-        cdnUrl: getR2FileUrl(sanitizedFile)
-      };
-    });
-    
-    res.json({
-      success: true,
-      results,
-      domain: R2_CONFIG.customDomain,
-      cached: true,
-      totalFiles: files.length,
-      source: 'cdn-batch'
-    });
-
-  } catch (error) {
-    console.error('Error generating batch CDN URLs:', error);
-    
-    res.status(500).json({
-      error: 'Failed to generate batch CDN URLs',
-      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
-  }
 });
 
 // Debug endpoint to check environment variables
@@ -209,10 +197,73 @@ app.get('/debug-env', (req, res) => {
   });
 });
 
-// Get signed download URL
+// Cache statistics endpoint
+app.get('/cache-stats', (req, res) => {
+  try {
+    const stats = CacheService.getStats();
+    res.status(200).json({
+      success: true,
+      cache: stats,
+      config: {
+        cacheTTL: CACHE_TTL,
+        maxCacheKeys: MAX_CACHE_KEYS,
+        checkPeriod: CACHE_CHECK_PERIOD
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error getting cache stats:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve cache statistics'
+    });
+  }
+});
+
+// Clear cache endpoint (for debugging/maintenance)
+app.post('/clear-cache', (req, res) => {
+  try {
+    const { pattern } = req.body;
+    
+    if (pattern) {
+      // Clear specific pattern (basic implementation)
+      const memoryKeys = signedUrlCache.keys();
+      const matchingKeys = memoryKeys.filter(key => key.includes(pattern));
+      
+      matchingKeys.forEach(key => {
+        signedUrlCache.del(key);
+      });
+      
+      res.json({
+        success: true,
+        message: `Cleared ${matchingKeys.length} cache entries matching pattern: ${pattern}`,
+        clearedKeys: matchingKeys.length
+      });
+    } else {
+      // Clear all cache
+      signedUrlCache.flushAll();
+      if (redisClient && redisClient.isReady) {
+        redisClient.flushAll().catch(err => console.error('Redis flush error:', err));
+      }
+      
+      res.json({
+        success: true,
+        message: 'All cache cleared'
+      });
+    }
+  } catch (error) {
+    console.error('Error clearing cache:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to clear cache'
+    });
+  }
+});
+
+// Get signed download URL with caching
 app.get('/getSignedUrl', async (req, res) => {
   try {
-    const { file, preferCDN } = req.query;
+    const { file } = req.query;
     
     if (!file) {
       return res.status(400).json({
@@ -231,18 +282,29 @@ app.get('/getSignedUrl', async (req, res) => {
     // Sanitize file path (basic security)
     const sanitizedFile = file.replace(/\.\./g, '').trim();
     
-    // If CDN is preferred and available, return CDN URL instead of signed URL
-    if (preferCDN === 'true' && R2_CONFIG.useCustomDomain && R2_CONFIG.customDomain) {
-      const cdnUrl = getR2FileUrl(sanitizedFile);
-      return res.json({
-        success: true,
-        signedUrl: cdnUrl,
-        file: sanitizedFile,
-        contentType: 'application/octet-stream',
-        expiresIn: 86400, // CDN cached for 1 day
-        expiresAt: new Date(Date.now() + 86400 * 1000).toISOString(),
-        source: 'cdn'
-      });
+    // Generate cache key
+    const cacheKey = CacheService.generateCacheKey(process.env.R2_BUCKET, sanitizedFile, 'get');
+    
+    // Check cache first
+    const cachedResponse = await CacheService.get(cacheKey);
+    if (cachedResponse) {
+      const cached = JSON.parse(cachedResponse);
+      // Check if cached URL is still valid (with 5 minute buffer before expiry)
+      const expiryTime = new Date(cached.expiresAt).getTime();
+      const bufferTime = 5 * 60 * 1000; // 5 minutes
+      
+      if (Date.now() < (expiryTime - bufferTime)) {
+        console.log(`🚀 Serving cached signed URL for: ${sanitizedFile}`);
+        return res.json({
+          ...cached,
+          fromCache: true,
+          cacheKey
+        });
+      } else {
+        // URL is close to expiry, remove from cache
+        await CacheService.del(cacheKey);
+        console.log(`⏰ Cached URL expired for: ${sanitizedFile}`);
+      }
     }
     
     // Determine content type and headers based on file extension
@@ -275,21 +337,27 @@ app.get('/getSignedUrl', async (req, res) => {
     });
 
     // Generate iOS-compatible signed URL
+    console.log(`🔄 Generating new signed URL for: ${sanitizedFile}`);
     const signedUrl = await getSignedUrl(s3Client, command, {
       expiresIn: 3600, // 1 hour
       // iOS-compatible options - avoid problematic query parameters
       signableHeaders: new Set(['host']), // Only sign host header
     });
 
-    res.json({
+    const response = {
       success: true,
       signedUrl,
       file: sanitizedFile,
       contentType: responseContentType,
       expiresIn: 3600,
       expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
-      source: 'signed'
-    });
+      fromCache: false
+    };
+
+    // Cache the response
+    await CacheService.set(cacheKey, JSON.stringify(response), CACHE_TTL);
+
+    res.json(response);
 
   } catch (error) {
     console.error('Error generating download signed URL:', error);
@@ -514,13 +582,18 @@ app.delete('/deleteFile', async (req, res) => {
 
     await s3Client.send(command);
 
+    // Invalidate cache for this file
+    const cacheKey = CacheService.generateCacheKey(process.env.R2_BUCKET, sanitizedFile, 'get');
+    await CacheService.del(cacheKey);
+
     console.log(`Successfully deleted file: ${sanitizedFile}`);
 
     res.json({
       success: true,
       message: 'File deleted successfully',
       file: sanitizedFile,
-      deletedAt: new Date().toISOString()
+      deletedAt: new Date().toISOString(),
+      cacheInvalidated: true
     });
 
   } catch (error) {
@@ -565,9 +638,56 @@ app.use('*', (req, res) => {
       'GET /health',
       'GET /getSignedUrl?file=FILENAME',
       'POST /getUploadUrl',
-      'DELETE /deleteFile'
+      'DELETE /deleteFile',
+      'GET /cache-stats',
+      'POST /clear-cache',
+      'POST /invalidate-cache'
     ]
   });
+});
+
+// Invalidate cache for uploaded files
+app.post('/invalidate-cache', (req, res) => {
+  try {
+    const { file } = req.body;
+    
+    if (!file) {
+      return res.status(400).json({
+        error: 'File parameter is required in request body',
+        example: { file: 'books/cover.jpg' }
+      });
+    }
+
+    // Validate file parameter
+    if (typeof file !== 'string' || file.trim() === '') {
+      return res.status(400).json({
+        error: 'Invalid file parameter'
+      });
+    }
+
+    // Sanitize file path
+    const sanitizedFile = file.replace(/\.\./g, '').trim();
+    
+    // Invalidate cache for this file
+    const cacheKey = CacheService.generateCacheKey(process.env.R2_BUCKET, sanitizedFile, 'get');
+    CacheService.del(cacheKey);
+
+    res.json({
+      success: true,
+      message: 'Cache invalidated successfully',
+      file: sanitizedFile,
+      cacheKey,
+      invalidatedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error invalidating cache:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to invalidate cache',
+      message: error.message
+    });
+  }
 });
 
 // Start server
