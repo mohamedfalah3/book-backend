@@ -11,9 +11,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Cache configuration
-const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS) || 600; // 10 minutes default
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS) || 3600; // 1 hour default (increased)
+const SIGNED_URL_EXPIRY = parseInt(process.env.SIGNED_URL_EXPIRY_SECONDS) || 7200; // 2 hours signed URL expiry
 const CACHE_CHECK_PERIOD = 60; // Check for expired keys every 60 seconds
-const MAX_CACHE_KEYS = parseInt(process.env.MAX_CACHE_KEYS) || 1000; // Maximum cached URLs
+const MAX_CACHE_KEYS = parseInt(process.env.MAX_CACHE_KEYS) || 5000; // Increased cache capacity
+const BATCH_DELAY_MS = parseInt(process.env.BATCH_DELAY_MS) || 50; // Reduced delay for faster processing
 
 // Initialize in-memory cache
 const signedUrlCache = new NodeCache({
@@ -140,6 +142,79 @@ class CacheService {
     } catch (error) {
       console.error('Cache set error:', error);
       // Continue execution even if caching fails
+    }
+  }
+
+  // Batch cache operations for high-volume scenarios
+  static async setBatch(entries, ttl = CACHE_TTL) {
+    try {
+      if (redisClient && redisClient.isReady && entries.length > 0) {
+        // Use Redis pipeline for batch operations
+        const pipeline = redisClient.multi();
+        entries.forEach(({ key, value }) => {
+          pipeline.setEx(key, ttl, value);
+        });
+        await pipeline.exec();
+        console.log(`💾 Batch cached ${entries.length} entries to Redis (TTL: ${ttl}s)`);
+      }
+
+      // Batch store in memory cache
+      entries.forEach(({ key, value }) => {
+        signedUrlCache.set(key, value, ttl);
+      });
+      console.log(`💾 Batch cached ${entries.length} entries to Memory (TTL: ${ttl}s)`);
+    } catch (error) {
+      console.error('Batch cache set error:', error);
+      // Fall back to individual caching
+      for (const { key, value } of entries) {
+        await this.set(key, value, ttl);
+      }
+    }
+  }
+
+  static async getBatch(cacheKeys) {
+    const results = new Map();
+    
+    try {
+      if (redisClient && redisClient.isReady && cacheKeys.length > 0) {
+        // Use Redis pipeline for batch get
+        const pipeline = redisClient.multi();
+        cacheKeys.forEach(key => pipeline.get(key));
+        const redisResults = await pipeline.exec();
+        
+        cacheKeys.forEach((key, index) => {
+          const result = redisResults[index];
+          if (result && result[1]) {
+            results.set(key, result[1]);
+            console.log(`✅ Batch Cache HIT (Redis): ${key}`);
+          }
+        });
+      }
+
+      // Check memory cache for any missed keys
+      cacheKeys.forEach(key => {
+        if (!results.has(key)) {
+          const cached = signedUrlCache.get(key);
+          if (cached) {
+            results.set(key, cached);
+            console.log(`✅ Batch Cache HIT (Memory): ${key}`);
+          } else {
+            console.log(`❌ Batch Cache MISS: ${key}`);
+          }
+        }
+      });
+
+      return results;
+    } catch (error) {
+      console.error('Batch cache get error:', error);
+      // Fall back to individual gets
+      for (const key of cacheKeys) {
+        const value = await this.get(key);
+        if (value) {
+          results.set(key, value);
+        }
+      }
+      return results;
     }
   }
 
@@ -339,7 +414,7 @@ app.get('/getSignedUrl', async (req, res) => {
     // Generate iOS-compatible signed URL
     console.log(`🔄 Generating new signed URL for: ${sanitizedFile}`);
     const signedUrl = await getSignedUrl(s3Client, command, {
-      expiresIn: 3600, // 1 hour
+      expiresIn: SIGNED_URL_EXPIRY, // 2 hours (configurable)
       // iOS-compatible options - avoid problematic query parameters
       signableHeaders: new Set(['host']), // Only sign host header
     });
@@ -349,8 +424,8 @@ app.get('/getSignedUrl', async (req, res) => {
       signedUrl,
       file: sanitizedFile,
       contentType: responseContentType,
-      expiresIn: 3600,
-      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+      expiresIn: SIGNED_URL_EXPIRY,
+      expiresAt: new Date(Date.now() + SIGNED_URL_EXPIRY * 1000).toISOString(),
       fromCache: false
     };
 
@@ -435,7 +510,7 @@ app.get('/getIOSAudioUrl', async (req, res) => {
 
     // Generate iOS-compatible signed URL with minimal parameters
     const signedUrl = await getSignedUrl(s3Client, command, {
-      expiresIn: 3600, // 1 hour
+      expiresIn: SIGNED_URL_EXPIRY, // 2 hours (configurable)
       // iOS-compatible options - minimal query parameters
       signableHeaders: new Set(['host']), // Only sign host header
     });
@@ -445,8 +520,8 @@ app.get('/getIOSAudioUrl', async (req, res) => {
       signedUrl,
       file: sanitizedFile,
       contentType: responseContentType,
-      expiresIn: 3600,
-      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+      expiresIn: SIGNED_URL_EXPIRY,
+      expiresAt: new Date(Date.now() + SIGNED_URL_EXPIRY * 1000).toISOString(),
       platform: 'ios-optimized',
       headers: {
         'Content-Type': responseContentType,
@@ -476,7 +551,7 @@ app.get('/getIOSAudioUrl', async (req, res) => {
 // Batch signed URLs endpoint for multiple files
 app.post('/getBatchSignedUrls', async (req, res) => {
   try {
-    const { files, batchSize = 10 } = req.body;
+    const { files, batchSize = 15 } = req.body;
     
     if (!files || !Array.isArray(files) || files.length === 0) {
       return res.status(400).json({
@@ -485,18 +560,20 @@ app.post('/getBatchSignedUrls', async (req, res) => {
       });
     }
 
-    if (files.length > 100) {
+    // Increased maximum for high-volume scenarios
+    if (files.length > 500) {
       return res.status(400).json({
-        error: 'Maximum 100 files per batch request'
+        error: 'Maximum 500 files per batch request. For larger batches, split into multiple requests.'
       });
     }
 
-    console.log(`📦 Processing batch request for ${files.length} files (batch size: ${batchSize})`);
+    console.log(`📦 Processing high-volume batch request for ${files.length} files (batch size: ${batchSize})`);
     
     const results = [];
     const errors = [];
+    const startTime = Date.now();
     
-    // Process files in batches to avoid overwhelming R2
+    // Process files in optimized batches
     for (let i = 0; i < files.length; i += batchSize) {
       const batch = files.slice(i, i + batchSize);
       console.log(`🔄 Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(files.length / batchSize)}`);
@@ -568,7 +645,7 @@ app.post('/getBatchSignedUrls', async (req, res) => {
           // Generate signed URL
           console.log(`🔄 Batch: Generating new signed URL for: ${sanitizedFile}`);
           const signedUrl = await getSignedUrl(s3Client, command, {
-            expiresIn: 3600, // 1 hour
+            expiresIn: SIGNED_URL_EXPIRY, // 2 hours (configurable)
             signableHeaders: new Set(['host']),
           });
 
@@ -577,8 +654,8 @@ app.post('/getBatchSignedUrls', async (req, res) => {
             signedUrl,
             file: sanitizedFile,
             contentType: responseContentType,
-            expiresIn: 3600,
-            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            expiresIn: SIGNED_URL_EXPIRY,
+            expiresAt: new Date(Date.now() + SIGNED_URL_EXPIRY * 1000).toISOString(),
             fromCache: false
           };
 
@@ -609,13 +686,17 @@ app.post('/getBatchSignedUrls', async (req, res) => {
         }
       });
 
-      // Small delay between batches to be gentle on R2
+      // Smart delay between batches - shorter delay for smaller batches
       if (i + batchSize < files.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        const delayMs = Math.max(BATCH_DELAY_MS, Math.min(200, batchSize * 10));
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
 
-    console.log(`✅ Batch completed: ${results.length} successful, ${errors.length} errors`);
+    const processingTime = Date.now() - startTime;
+    const avgTimePerFile = processingTime / files.length;
+    
+    console.log(`✅ High-volume batch completed: ${results.length} successful, ${errors.length} errors in ${processingTime}ms`);
 
     res.json({
       success: true,
@@ -626,7 +707,12 @@ app.post('/getBatchSignedUrls', async (req, res) => {
         successful: results.length,
         failed: errors.length,
         cached: results.filter(r => r.fromCache).length,
-        fresh: results.filter(r => !r.fromCache).length
+        fresh: results.filter(r => !r.fromCache).length,
+        performance: {
+          totalTimeMs: processingTime,
+          avgTimePerFileMs: Math.round(avgTimePerFile * 100) / 100,
+          throughputFilesPerSecond: Math.round((files.length / processingTime) * 1000 * 100) / 100
+        }
       },
       processedAt: new Date().toISOString()
     });
@@ -687,7 +773,7 @@ app.post('/getUploadUrl', async (req, res) => {
 
     // Generate iOS-compatible signed URL
     const signedUrl = await getSignedUrl(s3Client, command, {
-      expiresIn: 3600, // 1 hour
+      expiresIn: SIGNED_URL_EXPIRY, // 2 hours (configurable)
       // iOS-compatible options - avoid problematic query parameters
       signableHeaders: new Set(['host']), // Only sign host header
     });
@@ -698,8 +784,8 @@ app.post('/getUploadUrl', async (req, res) => {
       file: sanitizedFile,
       contentType,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-      expiresIn: 3600,
-      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString()
+      expiresIn: SIGNED_URL_EXPIRY,
+      expiresAt: new Date(Date.now() + SIGNED_URL_EXPIRY * 1000).toISOString()
     });
 
   } catch (error) {
