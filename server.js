@@ -473,6 +473,173 @@ app.get('/getIOSAudioUrl', async (req, res) => {
   }
 });
 
+// Batch signed URLs endpoint for multiple files
+app.post('/getBatchSignedUrls', async (req, res) => {
+  try {
+    const { files, batchSize = 10 } = req.body;
+    
+    if (!files || !Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({
+        error: 'Files array is required',
+        example: { files: ['books/cover1.jpg', 'books/cover2.jpg'] }
+      });
+    }
+
+    if (files.length > 100) {
+      return res.status(400).json({
+        error: 'Maximum 100 files per batch request'
+      });
+    }
+
+    console.log(`📦 Processing batch request for ${files.length} files (batch size: ${batchSize})`);
+    
+    const results = [];
+    const errors = [];
+    
+    // Process files in batches to avoid overwhelming R2
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      console.log(`🔄 Processing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(files.length / batchSize)}`);
+      
+      const batchPromises = batch.map(async (file) => {
+        try {
+          // Validate file parameter
+          if (typeof file !== 'string' || file.trim() === '') {
+            return { file, error: 'Invalid file parameter' };
+          }
+
+          // Sanitize file path
+          const sanitizedFile = file.replace(/\.\./g, '').trim();
+          
+          // Generate cache key
+          const cacheKey = CacheService.generateCacheKey(process.env.R2_BUCKET, sanitizedFile, 'get');
+          
+          // Check cache first
+          const cachedResponse = await CacheService.get(cacheKey);
+          if (cachedResponse) {
+            const cached = JSON.parse(cachedResponse);
+            // Check if cached URL is still valid (with 5 minute buffer before expiry)
+            const expiryTime = new Date(cached.expiresAt).getTime();
+            const bufferTime = 5 * 60 * 1000; // 5 minutes
+            
+            if (Date.now() < (expiryTime - bufferTime)) {
+              console.log(`🚀 Batch: Serving cached signed URL for: ${sanitizedFile}`);
+              return {
+                ...cached,
+                fromCache: true,
+                file: sanitizedFile
+              };
+            } else {
+              // URL is close to expiry, remove from cache
+              await CacheService.del(cacheKey);
+              console.log(`⏰ Batch: Cached URL expired for: ${sanitizedFile}`);
+            }
+          }
+          
+          // Determine content type based on file extension
+          const fileExtension = sanitizedFile.split('.').pop()?.toLowerCase();
+          let responseContentType = 'application/octet-stream';
+          let responseContentDisposition = 'inline';
+          
+          if (fileExtension) {
+            if (['mp3'].includes(fileExtension)) {
+              responseContentType = 'audio/mpeg';
+            } else if (['m4a'].includes(fileExtension)) {
+              responseContentType = 'audio/mp4';
+            } else if (['aac'].includes(fileExtension)) {
+              responseContentType = 'audio/aac';
+            } else if (['wav'].includes(fileExtension)) {
+              responseContentType = 'audio/wav';
+            } else if (['jpg', 'jpeg'].includes(fileExtension)) {
+              responseContentType = 'image/jpeg';
+            } else if (['png'].includes(fileExtension)) {
+              responseContentType = 'image/png';
+            }
+          }
+          
+          const command = new GetObjectCommand({
+            Bucket: process.env.R2_BUCKET,
+            Key: sanitizedFile,
+            ResponseContentType: responseContentType,
+            ResponseContentDisposition: responseContentDisposition,
+            ResponseCacheControl: responseContentType.startsWith('audio/') ? 'public, max-age=31536000' : undefined,
+          });
+
+          // Generate signed URL
+          console.log(`🔄 Batch: Generating new signed URL for: ${sanitizedFile}`);
+          const signedUrl = await getSignedUrl(s3Client, command, {
+            expiresIn: 3600, // 1 hour
+            signableHeaders: new Set(['host']),
+          });
+
+          const response = {
+            success: true,
+            signedUrl,
+            file: sanitizedFile,
+            contentType: responseContentType,
+            expiresIn: 3600,
+            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            fromCache: false
+          };
+
+          // Cache the response
+          await CacheService.set(cacheKey, JSON.stringify(response), CACHE_TTL);
+
+          return response;
+
+        } catch (error) {
+          console.error(`Error processing file ${file}:`, error);
+          return { 
+            file, 
+            error: error.message || 'Failed to generate signed URL',
+            success: false
+          };
+        }
+      });
+
+      // Wait for current batch to complete
+      const batchResults = await Promise.all(batchPromises);
+      
+      // Separate successful results from errors
+      batchResults.forEach(result => {
+        if (result.success !== false) {
+          results.push(result);
+        } else {
+          errors.push(result);
+        }
+      });
+
+      // Small delay between batches to be gentle on R2
+      if (i + batchSize < files.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    console.log(`✅ Batch completed: ${results.length} successful, ${errors.length} errors`);
+
+    res.json({
+      success: true,
+      results,
+      errors,
+      stats: {
+        total: files.length,
+        successful: results.length,
+        failed: errors.length,
+        cached: results.filter(r => r.fromCache).length,
+        fresh: results.filter(r => !r.fromCache).length
+      },
+      processedAt: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error in batch signed URL generation:', error);
+    res.status(500).json({
+      error: 'Failed to process batch request',
+      message: error.message || 'Internal server error'
+    });
+  }
+});
+
 // Get signed upload URL
 app.post('/getUploadUrl', async (req, res) => {
   try {
@@ -637,6 +804,7 @@ app.use('*', (req, res) => {
     availableEndpoints: [
       'GET /health',
       'GET /getSignedUrl?file=FILENAME',
+      'POST /getBatchSignedUrls - Batch processing for multiple files',
       'POST /getUploadUrl',
       'DELETE /deleteFile',
       'GET /cache-stats',
