@@ -19,6 +19,28 @@ const s3Client = new S3Client({
   },
 });
 
+// R2 Domain Configuration
+const R2_CONFIG = {
+  useCustomDomain: process.env.R2_USE_CUSTOM_DOMAIN === 'true',
+  customDomain: process.env.R2_CUSTOM_DOMAIN || null,
+  directEndpoint: `${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  bucketName: process.env.R2_BUCKET
+};
+
+/**
+ * Get the appropriate URL for R2 files
+ */
+function getR2FileUrl(filePath) {
+  // Remove r2:// prefix if present
+  const cleanPath = filePath.startsWith('r2://') ? filePath.replace('r2://', '') : filePath;
+  
+  if (R2_CONFIG.useCustomDomain && R2_CONFIG.customDomain) {
+    return `https://${R2_CONFIG.customDomain}/${cleanPath}`;
+  }
+  
+  return `https://${R2_CONFIG.directEndpoint}/${cleanPath}`;
+}
+
 // Security middleware
 app.use(helmet());
 
@@ -53,8 +75,124 @@ app.get('/health', (req, res) => {
     status: 'OK',
     timestamp: new Date().toISOString(),
     service: 'R2 Signed URL Service',
-    version: '1.0.0'
+    version: '1.0.0',
+    r2Config: {
+      useCustomDomain: R2_CONFIG.useCustomDomain,
+      customDomain: R2_CONFIG.customDomain || 'not configured',
+      bucketName: R2_CONFIG.bucketName
+    }
   });
+});
+
+// Get CDN URL (direct access via custom domain)
+app.get('/getCDNUrl', async (req, res) => {
+  try {
+    const { file } = req.query;
+    
+    if (!file) {
+      return res.status(400).json({
+        error: 'File parameter is required',
+        example: '/getCDNUrl?file=books/cover.jpg'
+      });
+    }
+
+    // Validate file parameter
+    if (typeof file !== 'string' || file.trim() === '') {
+      return res.status(400).json({
+        error: 'Invalid file parameter'
+      });
+    }
+
+    // Sanitize file path
+    const sanitizedFile = file.replace(/\.\./g, '').trim();
+    
+    // Check if custom domain is configured
+    if (!R2_CONFIG.useCustomDomain || !R2_CONFIG.customDomain) {
+      return res.status(503).json({
+        error: 'CDN not configured',
+        message: 'Custom domain is not set up for this R2 bucket',
+        fallback: 'Use /getSignedUrl instead'
+      });
+    }
+    
+    // Generate CDN URL
+    const cdnUrl = getR2FileUrl(sanitizedFile);
+    
+    res.json({
+      success: true,
+      cdnUrl,
+      file: sanitizedFile,
+      domain: R2_CONFIG.customDomain,
+      cached: true,
+      expiresIn: 86400, // CDN cache duration
+      expiresAt: new Date(Date.now() + 86400 * 1000).toISOString(),
+      source: 'cdn'
+    });
+
+  } catch (error) {
+    console.error('Error generating CDN URL:', error);
+    
+    res.status(500).json({
+      error: 'Failed to generate CDN URL',
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
+
+// Batch CDN URLs endpoint
+app.post('/getBatchCDNUrls', async (req, res) => {
+  try {
+    const { files } = req.body;
+    
+    if (!files || !Array.isArray(files)) {
+      return res.status(400).json({
+        error: 'Files array is required',
+        example: { files: ['books/cover1.jpg', 'books/cover2.jpg'] }
+      });
+    }
+
+    if (files.length > 100) {
+      return res.status(400).json({
+        error: 'Too many files requested',
+        message: 'Maximum 100 files per batch request'
+      });
+    }
+    
+    // Check if custom domain is configured
+    if (!R2_CONFIG.useCustomDomain || !R2_CONFIG.customDomain) {
+      return res.status(503).json({
+        error: 'CDN not configured',
+        message: 'Custom domain is not set up for this R2 bucket'
+      });
+    }
+    
+    // Generate CDN URLs for all files
+    const results = files.map(file => {
+      const sanitizedFile = file.replace(/\.\./g, '').trim();
+      return {
+        originalFile: file,
+        file: sanitizedFile,
+        cdnUrl: getR2FileUrl(sanitizedFile)
+      };
+    });
+    
+    res.json({
+      success: true,
+      results,
+      domain: R2_CONFIG.customDomain,
+      cached: true,
+      totalFiles: files.length,
+      source: 'cdn-batch'
+    });
+
+  } catch (error) {
+    console.error('Error generating batch CDN URLs:', error);
+    
+    res.status(500).json({
+      error: 'Failed to generate batch CDN URLs',
+      message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
 });
 
 // Debug endpoint to check environment variables
@@ -74,7 +212,7 @@ app.get('/debug-env', (req, res) => {
 // Get signed download URL
 app.get('/getSignedUrl', async (req, res) => {
   try {
-    const { file } = req.query;
+    const { file, preferCDN } = req.query;
     
     if (!file) {
       return res.status(400).json({
@@ -92,6 +230,20 @@ app.get('/getSignedUrl', async (req, res) => {
 
     // Sanitize file path (basic security)
     const sanitizedFile = file.replace(/\.\./g, '').trim();
+    
+    // If CDN is preferred and available, return CDN URL instead of signed URL
+    if (preferCDN === 'true' && R2_CONFIG.useCustomDomain && R2_CONFIG.customDomain) {
+      const cdnUrl = getR2FileUrl(sanitizedFile);
+      return res.json({
+        success: true,
+        signedUrl: cdnUrl,
+        file: sanitizedFile,
+        contentType: 'application/octet-stream',
+        expiresIn: 86400, // CDN cached for 1 day
+        expiresAt: new Date(Date.now() + 86400 * 1000).toISOString(),
+        source: 'cdn'
+      });
+    }
     
     // Determine content type and headers based on file extension
     const fileExtension = sanitizedFile.split('.').pop()?.toLowerCase();
@@ -135,7 +287,8 @@ app.get('/getSignedUrl', async (req, res) => {
       file: sanitizedFile,
       contentType: responseContentType,
       expiresIn: 3600,
-      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString()
+      expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+      source: 'signed'
     });
 
   } catch (error) {
@@ -418,10 +571,11 @@ app.use('*', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 R2 Signed URL Service running on port ${PORT}`);
   console.log(`📁 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔗 Local: http://localhost:${PORT}/health`);
+  console.log(`🔗 Network: http://192.168.100.15:${PORT}/health`);
 });
 
 // Graceful shutdown
