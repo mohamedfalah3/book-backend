@@ -4,7 +4,26 @@ const helmet = require('helmet');
 const NodeCache = require('node-cache');
 const { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const admin = require('firebase-admin');
 require('dotenv').config();
+
+// Initialize Firebase Admin
+if (!admin.apps.length) {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      }),
+      databaseURL: process.env.FIREBASE_DATABASE_URL,
+    });
+    console.log('✅ Firebase Admin initialized successfully');
+  } catch (error) {
+    console.error('❌ Firebase Admin initialization failed:', error);
+    console.log('⚠️ Books API endpoints will not work without Firebase credentials');
+  }
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -940,6 +959,15 @@ const BOOKS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 // New route: Get paginated books summary
 app.get('/api/books-summary', async (req, res) => {
   try {
+    // Check if Firebase is available
+    if (!admin.apps.length || !admin.firestore) {
+      console.error('❌ Firebase not available for books summary');
+      return res.status(503).json({ 
+        error: 'Books service temporarily unavailable',
+        message: 'Firebase connection not established'
+      });
+    }
+
     const { page = 1, limit = 20, lastBookId } = req.query;
     const pageSize = Math.min(parseInt(limit), 50); // Max 50 per page
     
@@ -1009,6 +1037,15 @@ app.get('/api/books-summary', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Error fetching books summary:', error);
+    
+    // Check if it's a Firebase connection error
+    if (error.code === 'app/no-app' || error.code === 'app/duplicate-app') {
+      return res.status(503).json({ 
+        error: 'Books service temporarily unavailable',
+        message: 'Firebase connection issue'
+      });
+    }
+    
     res.status(500).json({ error: 'Failed to fetch books' });
   }
 });
@@ -1016,6 +1053,15 @@ app.get('/api/books-summary', async (req, res) => {
 // New route: Get single book by ID (for detail view)
 app.get('/api/books/:id', async (req, res) => {
   try {
+    // Check if Firebase is available
+    if (!admin.apps.length || !admin.firestore) {
+      console.error('❌ Firebase not available for single book');
+      return res.status(503).json({ 
+        error: 'Book service temporarily unavailable',
+        message: 'Firebase connection not established'
+      });
+    }
+
     const { id } = req.params;
     
     // Check cache first
@@ -1055,8 +1101,55 @@ app.get('/api/books/:id', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Error fetching book:', error);
+    
+    // Check if it's a Firebase connection error
+    if (error.code === 'app/no-app' || error.code === 'app/duplicate-app') {
+      return res.status(503).json({ 
+        error: 'Book service temporarily unavailable',
+        message: 'Firebase connection issue'
+      });
+    }
+    
     res.status(500).json({ error: 'Failed to fetch book' });
   }
+});
+
+// Fallback books endpoint when Firebase is not available
+app.get('/api/books-fallback', (req, res) => {
+  console.log('📚 Serving fallback books data (Firebase not available)');
+  
+  const fallbackBooks = [
+    {
+      id: 'fallback-1',
+      title: 'Sample Book 1',
+      author: 'Sample Author',
+      genre: 'Fiction',
+      coverImage: 'https://via.placeholder.com/300x400/cccccc/666666?text=Book+1',
+      duration: 3600,
+      updatedAt: new Date().toISOString(),
+    },
+    {
+      id: 'fallback-2',
+      title: 'Sample Book 2',
+      author: 'Sample Author',
+      genre: 'Non-Fiction',
+      coverImage: 'https://via.placeholder.com/300x400/cccccc/666666?text=Book+2',
+      duration: 7200,
+      updatedAt: new Date().toISOString(),
+    }
+  ];
+  
+  res.json({
+    books: fallbackBooks,
+    hasMore: false,
+    nextPage: null,
+    lastBookId: null,
+    totalFetched: fallbackBooks.length,
+    page: 1,
+    pageSize: fallbackBooks.length,
+    fallback: true,
+    message: 'Using fallback data - Firebase not available'
+  });
 });
 
 // Enhanced signed URL batching and caching
@@ -1067,7 +1160,7 @@ const BATCH_DELAY = 100; // 100ms delay between batches
 async function generateSignedUrl(key, retries = 3) {
   try {
     const command = new GetObjectCommand({
-      Bucket: process.env.R2_BUCKET_NAME,
+      Bucket: process.env.R2_BUCKET,
       Key: key,
     });
     
