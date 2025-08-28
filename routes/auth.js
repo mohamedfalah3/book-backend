@@ -28,11 +28,11 @@ const verifyRateLimit = rateLimit({
   legacyHeaders: false,
 });
 
-// Validate phone number format
+// Validate phone number format (Iraqi format)
 const validatePhoneNumber = (phoneNumber) => {
-  // Basic phone number validation - adjust regex based on your requirements
-  const phoneRegex = /^\+?[1-9]\d{1,14}$/;
-  return phoneRegex.test(phoneNumber);
+  // Iraqi phone number validation: 964XXXXXXXXX (11 digits starting with 964)
+  const iraqiPhoneRegex = /^964[0-9]{8}$/;
+  return iraqiPhoneRegex.test(phoneNumber);
 };
 
 // Validate OTP format
@@ -41,6 +41,14 @@ const validateOTP = (otp) => {
   const otpRegex = /^\d{4,6}$/;
   return otpRegex.test(otp);
 };
+
+// GET /status - Health check for auth service
+router.get('/status', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'Authentication service is running'
+  });
+});
 
 // POST /send-otp
 router.post('/send-otp', otpRateLimit, async (req, res) => {
@@ -59,7 +67,7 @@ router.post('/send-otp', otpRateLimit, async (req, res) => {
     if (!validatePhoneNumber(phoneNumber)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid phone number format'
+        message: 'Invalid phone number format. Please use Iraqi format: 964XXXXXXXXX'
       });
     }
 
@@ -110,7 +118,7 @@ router.post('/verify-otp', verifyRateLimit, async (req, res) => {
     if (!validatePhoneNumber(phoneNumber)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid phone number format'
+        message: 'Invalid phone number format. Please use Iraqi format: 964XXXXXXXXX'
       });
     }
 
@@ -118,29 +126,18 @@ router.post('/verify-otp', verifyRateLimit, async (req, res) => {
     if (!validateOTP(verificationCode)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid OTP format'
+        message: 'Invalid OTP format. Please enter a valid verification code'
       });
     }
 
-    // Complete authentication flow
+    // Authenticate user
     const result = await authService.authenticateUser(phoneNumber, verificationCode);
 
     if (result.success) {
       return res.status(200).json({
         success: true,
         message: 'Authentication successful',
-        data: {
-          user: {
-            id: result.user.$id,
-            phone: result.user.phone,
-            lastLogin: result.user.lastLogin,
-            createdAt: result.user.createdAt
-          },
-          session: {
-            id: result.session.$id,
-            jwt: result.jwt
-          }
-        }
+        data: result.data
       });
     } else {
       return res.status(400).json({
@@ -152,25 +149,6 @@ router.post('/verify-otp', verifyRateLimit, async (req, res) => {
 
   } catch (error) {
     console.error('Error in verify-otp route:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: error.message
-    });
-  }
-});
-
-// GET /auth/status - Check authentication status
-router.get('/status', async (req, res) => {
-  try {
-    // This endpoint can be used to verify if a JWT is still valid
-    // You would need to implement JWT verification logic here
-    return res.status(200).json({
-      success: true,
-      message: 'Authentication service is running'
-    });
-  } catch (error) {
-    console.error('Error in auth status route:', error);
     return res.status(500).json({
       success: false,
       message: 'Internal server error',
