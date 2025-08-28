@@ -31,8 +31,7 @@ class AuthService {
         {
           phoneNumber: phoneNumber,
           smsType: "verification",
-          provider: "whatsapp-sms",
-          verificationCode: ""
+          provider: "whatsapp-sms"
         },
         {
           headers: {
