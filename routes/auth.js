@@ -30,8 +30,8 @@ const verifyRateLimit = rateLimit({
 
 // Validate phone number format (Iraqi format)
 const validatePhoneNumber = (phoneNumber) => {
-  // Iraqi phone number validation: 964XXXXXXXXX (11 digits starting with 964)
-  const iraqiPhoneRegex = /^964[0-9]{8}$/;
+  // Iraqi phone number validation: 964XXXXXXXXXXX (13 digits starting with 964)
+  const iraqiPhoneRegex = /^964[0-9]{10}$/;
   return iraqiPhoneRegex.test(phoneNumber);
 };
 
@@ -67,7 +67,7 @@ router.post('/send-otp', otpRateLimit, async (req, res) => {
     if (!validatePhoneNumber(phoneNumber)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid phone number format. Please use Iraqi format: 964XXXXXXXXX'
+        message: 'Invalid phone number format. Please use Iraqi format: 964XXXXXXXXXXX'
       });
     }
 
@@ -118,7 +118,7 @@ router.post('/verify-otp', verifyRateLimit, async (req, res) => {
     if (!validatePhoneNumber(phoneNumber)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid phone number format. Please use Iraqi format: 964XXXXXXXXX'
+        message: 'Invalid phone number format. Please use Iraqi format: 964XXXXXXXXXXX'
       });
     }
 
