@@ -13,6 +13,8 @@ const databases = new Databases(appwriteClient);
 class AuthService {
   constructor() {
     this.otpiqApiKey = process.env.OTPIQ_API_KEY;
+    // Store verification codes in memory (in production, use Redis or database)
+    this.verificationCodes = new Map();
   }
 
   // Send OTP via OTPIQ - Exact API format
@@ -26,12 +28,19 @@ class AuthService {
         };
       }
 
+      // Generate a random 6-digit verification code
+      const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+      
+      // Store the verification code for later verification
+      this.verificationCodes.set(phoneNumber, verificationCode);
+
       const response = await axios.post(
         'https://api.otpiq.com/api/sms',
         {
           phoneNumber: phoneNumber,
           smsType: "verification",
-          provider: "whatsapp-sms"
+          provider: "whatsapp-sms",
+          verificationCode: verificationCode
         },
         {
           headers: {
@@ -56,42 +65,43 @@ class AuthService {
     }
   }
 
-  // Verify OTP via OTPIQ - Exact API format
+  // Verify OTP - Check against stored verification code
   async verifyOTP(phoneNumber, verificationCode) {
     try {
-      if (!this.otpiqApiKey) {
+      // Get the stored verification code for this phone number
+      const storedCode = this.verificationCodes.get(phoneNumber);
+      
+      if (!storedCode) {
         return {
           success: false,
-          message: 'OTPIQ API key not configured',
-          error: 'Missing OTPIQ_API_KEY environment variable'
+          message: 'No OTP found for this phone number. Please request a new OTP.',
+          error: 'OTP expired or not found'
         };
       }
 
-      const response = await axios.post(
-        'https://api.otpiq.com/api/sms/verify',
-        {
-          phoneNumber: phoneNumber,
-          verificationCode: verificationCode
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${this.otpiqApiKey}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-
-      return {
-        success: true,
-        message: 'OTP verified successfully',
-        data: response.data
-      };
+      // Check if the provided code matches the stored code
+      if (verificationCode === storedCode) {
+        // Remove the verification code after successful verification
+        this.verificationCodes.delete(phoneNumber);
+        
+        return {
+          success: true,
+          message: 'OTP verified successfully',
+          data: { phoneNumber }
+        };
+      } else {
+        return {
+          success: false,
+          message: 'Invalid verification code',
+          error: 'Code mismatch'
+        };
+      }
     } catch (error) {
-      console.error('Error verifying OTP:', error.response?.data || error.message);
+      console.error('Error verifying OTP:', error);
       return {
         success: false,
-        message: error.response?.data?.message || 'Failed to verify OTP',
-        error: error.response?.data || error.message
+        message: 'Failed to verify OTP',
+        error: error.message
       };
     }
   }
