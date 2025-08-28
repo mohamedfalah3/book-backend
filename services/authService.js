@@ -30,9 +30,11 @@ class AuthService {
 
       // Generate a random 6-digit verification code
       const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+      console.log('Generated verification code:', verificationCode, 'for phone:', phoneNumber);
       
       // Store the verification code for later verification
       this.verificationCodes.set(phoneNumber, verificationCode);
+      console.log('Stored verification codes:', Array.from(this.verificationCodes.entries()));
 
       const response = await axios.post(
         'https://api.otpiq.com/api/sms',
@@ -68,8 +70,13 @@ class AuthService {
   // Verify OTP - Check against stored verification code
   async verifyOTP(phoneNumber, verificationCode) {
     try {
+      console.log('Verifying OTP for phone:', phoneNumber);
+      console.log('Provided code:', verificationCode);
+      console.log('Stored codes:', Array.from(this.verificationCodes.entries()));
+      
       // Get the stored verification code for this phone number
       const storedCode = this.verificationCodes.get(phoneNumber);
+      console.log('Stored code for this phone:', storedCode);
       
       if (!storedCode) {
         return {
