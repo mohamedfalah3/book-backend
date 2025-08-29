@@ -44,6 +44,7 @@ app.get('/auth/google', async (req, res) => {
         
     } catch (error) {
         console.error('Error creating OAuth session:', error);
+        console.error('Error details:', error);
         res.redirect(`${FAILURE_REDIRECT}&error=${encodeURIComponent(error.message)}`);
     }
 });
