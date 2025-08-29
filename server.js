@@ -31,24 +31,11 @@ app.get('/auth/google', async (req, res) => {
         console.log('Initiating Google OAuth...');
         
         // Create OAuth session with Appwrite using the correct method
-        // In newer versions of node-appwrite, the method might be different
-        let oauthUrl;
-        try {
-            // Try the newer method name
-            oauthUrl = await account.createOAuth2Session(
-                'google',
-                SUCCESS_REDIRECT,
-                FAILURE_REDIRECT
-            );
-        } catch (methodError) {
-            console.log('Trying alternative method name...');
-            // Try alternative method name
-            oauthUrl = await account.createOAuthSession(
-                'google',
-                SUCCESS_REDIRECT,
-                FAILURE_REDIRECT
-            );
-        }
+        const oauthUrl = await account.createOAuth2Session(
+            'google',
+            SUCCESS_REDIRECT,
+            FAILURE_REDIRECT
+        );
         
         console.log('OAuth URL created:', oauthUrl);
         
