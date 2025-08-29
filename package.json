@@ -1,7 +1,7 @@
 {
-  "name": "r2-backend",
+  "name": "oauth-backend",
   "version": "1.0.0",
-  "description": "Node.js backend for Cloudflare R2 signed URLs",
+  "description": "OAuth Backend Server for React Native App with Appwrite",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,32 +9,24 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
-    "cloudflare",
-    "r2",
-    "s3",
-    "signed-urls",
-    "express",
-    "nodejs"
+    "oauth",
+    "appwrite",
+    "react-native",
+    "google",
+    "authentication"
   ],
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "@aws-sdk/client-s3": "^3.450.0",
-    "@aws-sdk/s3-request-presigner": "^3.450.0",
-    "helmet": "^7.1.0",
-    "express-rate-limit": "^7.1.5",
-    "node-cache": "^5.1.2",
-    "redis": "^4.6.12",
-    "node-appwrite": "^17.2.0",
-    "axios": "^1.6.0"
+    "node-appwrite": "^13.0.1",
+    "dotenv": "^16.3.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   }
 }
